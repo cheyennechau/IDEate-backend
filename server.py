@@ -25,12 +25,6 @@ if not ANTHROPIC_API_KEY:
     raise RuntimeError("Please set ANTHROPIC_API_KEY in your environment")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-# API_URL = "https://api.anthropic.com/v1/messages"
-# HEADERS_ANTHROPIC = {
-#     "Content-Type": "application/json",
-#     "x-api-key": ANTHROPIC_API_KEY
-# }
-
 API_URL = "https://api.anthropic.com/v1/messages"
 HEADERS_ANTHROPIC = {
     "x-api-key": ANTHROPIC_API_KEY,
@@ -52,7 +46,7 @@ async def call_claude(prompt: str) -> str:
             {"role": "user", "content": prompt}
         ]
     }
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         print("Sending to Claude:", payload)
         r = await client.post(API_URL, headers=HEADERS_ANTHROPIC, json=payload)
         r.raise_for_status()
@@ -63,22 +57,6 @@ async def call_claude(prompt: str) -> str:
             return result["content"][0]["text"]
         except (KeyError, IndexError, ValueError) as e:
             raise HTTPException(status_code=500, detail="Error parsing Claude's response")
-
-
-# async def call_claude(prompt: str) -> str:
-#     payload = {
-#         "model": "claude-3-haiku-20240307",
-#         "max_tokens": 800,
-#         "temperature": 0.2,
-#         "messages": [
-#             {"role": "user", "content": prompt}
-#         ]
-#     }
-#     async with httpx.AsyncClient() as client:
-#         print("Sending to Claude:", payload)
-#         r = await client.post(API_URL, headers=HEADERS_ANTHROPIC, json=payload)
-#         r.raise_for_status()
-#         return r.json()["content"][0]["text"]
 
 async def persona_review(role: str, instruction: str, code: str, code_summary: str | None = None) -> str:
     if code_summary:
