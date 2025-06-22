@@ -7,7 +7,10 @@ import httpx
 from dotenv import load_dotenv
 from anthropic import HUMAN_PROMPT, AI_PROMPT
 from parsing import parse_github_url, extract_code_structure_summary
+import logging
+import time
 
+logging.basicConfig(level=logging.INFO)
 # Load environment variables
 load_dotenv()
 
@@ -42,13 +45,13 @@ async def call_claude(prompt: str) -> str:
         "model": "claude-3-haiku-20240307",
         "max_tokens": 800,
         "temperature": 0.2,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "messages": [{"role": "user", "content": prompt}]
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:  # ⬅️ increase timeout here
         print("Sending to Claude:", payload)
+        start = time.time()
         r = await client.post(API_URL, headers=HEADERS_ANTHROPIC, json=payload)
+        print("Claude responded in", time.time() - start, "seconds")
         r.raise_for_status()
 
         try:
@@ -78,28 +81,33 @@ async def get_default_branch(owner: str, repo: str) -> str:
     resp.raise_for_status()
     return resp.json().get("default_branch") or "main"
 
-async def list_python_files(owner: str, repo: str, branch: str) -> list[str]:
+async def list_python_files(owner: str, repo: str, branch: str, max_size_kb: int = 100) -> list[str]:
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers=GITHUB_API_HEADERS)
-    if resp.status_code == 409:
-        raise HTTPException(status_code=400, detail="Repository too large to list recursively")
     resp.raise_for_status()
     tree = resp.json().get("tree", [])
     return [
         item["path"]
         for item in tree
-        if item.get("type") == "blob" and item.get("path", "").endswith(".py")
+        if item.get("type") == "blob" and
+           item.get("path", "").endswith(".py") and
+           (item.get("size", 0) < max_size_kb * 1024)
     ]
 
 async def fetch_file_content(owner: str, repo: str, branch: str, path: str) -> str:
     raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+    print(f"\n🔍 Fetching file from: {raw_url}\n")
+
     async with httpx.AsyncClient() as client:
         resp = await client.get(raw_url)
+    
     if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="File not found in the specified branch")
+        raise HTTPException(status_code=404, detail=f"File not found: {raw_url}")
+    
     resp.raise_for_status()
     return resp.text
+
 
 class RepoRequest(BaseModel):
     repo_url: str = Field(..., example="https://github.com/octocat/Hello-World")
@@ -116,11 +124,16 @@ class ReviewResponse(BaseModel):
     security: str
     ux: str
     performance: str
+    test: str
+    ethics: str
     summary: str
 
 class DebateRequest(BaseModel):
     code: str
 
+class SummaryResponse(BaseModel):
+    summary_bullets: str
+    
 @app.post("/api/repos", response_model=FileListResponse)
 async def list_repo_files(req: RepoRequest) -> FileListResponse:
     owner, repo = parse_github_url(req.repo_url)
@@ -135,18 +148,23 @@ async def review_file(req: ReviewRequest) -> ReviewResponse:
     code = await fetch_file_content(owner, repo, branch, req.file_path)
     code_summary = extract_code_structure_summary(code)
 
-    security_res, ux_res, perf_res = await asyncio.gather(
+    security_res, ux_res, perf_res, test_res, ethics_res = await asyncio.gather(
         persona_review("security auditor", "review this code for vulnerabilities", code, code_summary),
         persona_review("UX designer", "critique readability and maintainability of this code", code, code_summary),
         persona_review("performance engineer", "suggest optimizations for this code", code, code_summary),
-    )
+        persona_review("test engineer", "identify areas lacking test coverage", code, code_summary),
+        persona_review("AI ethicist", "evaluate the code for potential bias or ethical concerns", code, code_summary),
+)
+
 
     action_plan = await call_claude(
-        f"Here are three expert reviews...\n\n"
-        f"-- Security Review:\n{security_res}\n\n"
-        f"-- UX Review:\n{ux_res}\n\n"
-        f"-- Performance Review:\n{perf_res}"
+        f"Here are expert reviews. Score and critique each other's review:\n\n"
+        f"Security: {security_res}\n\n"
+        f"UX: {ux_res}\n\n"
+        f"Performance: {perf_res}\n\n"
+        f"Give a final verdict."
     )
+
 
     return ReviewResponse(
         security=security_res,
@@ -180,6 +198,25 @@ async def debate_code(req: DebateRequest):
         "performance_review": perf_res,
         "action_plan": action_plan,
     }
+
+@app.post("/api/summary",  response_model=SummaryResponse)
+async def summarize_reviews(req: ReviewRequest) -> SummaryResponse:
+    owner, repo = parse_github_url(req.repo_url)
+    branch = req.branch or await get_default_branch(owner, repo)
+    code = await fetch_file_content(owner, repo, branch, req.file_path)
+    code_summary = extract_code_structure_summary(code)
+
+    reviews = await asyncio.gather(
+        persona_review("security auditor", "review this code for vulnerabilities", code, code_summary),
+        persona_review("UX designer", "critique readability and maintainability of this code", code, code_summary),
+        persona_review("performance engineer", "suggest optimizations for this code", code, code_summary),
+    )
+
+    summary = await call_claude(
+        f"Summarize the following reviews into short bullet points:\n\n" +
+        "\n\n".join(reviews)
+    )
+    return SummaryResponse(summary_bullets=summary)
 
 if __name__ == "__main__":
     import uvicorn
