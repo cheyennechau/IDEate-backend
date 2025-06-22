@@ -29,6 +29,17 @@ if not ANTHROPIC_API_KEY:
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 API_URL = "https://api.anthropic.com/v1/messages"
+
+AGENTS = {
+    "security": ("security auditor", "review this code for vulnerabilities"),
+    "ux": ("UX designer", "critique readability and maintainability of this code"),
+    "performance": ("performance engineer", "suggest optimizations for this code"),
+    "test": ("test engineer", "identify areas lacking test coverage"),
+    "ethics": ("AI ethicist", "evaluate the code for potential bias or ethical concerns"),
+    "architecture": ("software architect", "analyze the overall structure and design patterns"),
+    "documentation": ("documentation expert", "assess the code documentation and suggest improvements")
+}
+
 HEADERS_ANTHROPIC = {
     "x-api-key": ANTHROPIC_API_KEY,
     "anthropic-version": "2023-06-01",
@@ -126,6 +137,8 @@ class ReviewResponse(BaseModel):
     performance: str
     test: str
     ethics: str
+    architecture: str         # NEW
+    documentation: str        # NEW
     summary: str
 
 class DebateRequest(BaseModel):
@@ -148,56 +161,73 @@ async def review_file(req: ReviewRequest) -> ReviewResponse:
     code = await fetch_file_content(owner, repo, branch, req.file_path)
     code_summary = extract_code_structure_summary(code)
 
-    security_res, ux_res, perf_res, test_res, ethics_res = await asyncio.gather(
+    security_res, ux_res, perf_res, test_res, ethics_res, arch_res, doc_res = await asyncio.gather(
         persona_review("security auditor", "review this code for vulnerabilities", code, code_summary),
         persona_review("UX designer", "critique readability and maintainability of this code", code, code_summary),
         persona_review("performance engineer", "suggest optimizations for this code", code, code_summary),
         persona_review("test engineer", "identify areas lacking test coverage", code, code_summary),
         persona_review("AI ethicist", "evaluate the code for potential bias or ethical concerns", code, code_summary),
+        persona_review("software architect", "analyze the overall structure and design patterns", code, code_summary),  # NEW
+        persona_review("documentation expert", "assess the code documentation and suggest improvements", code, code_summary)  # NEW
 )
 
 
+
     action_plan = await call_claude(
-        f"Here are expert reviews. Score and critique each other's review:\n\n"
-        f"Security: {security_res}\n\n"
-        f"UX: {ux_res}\n\n"
-        f"Performance: {perf_res}\n\n"
-        f"Give a final verdict."
+        f"Here are three expert reviews...\n\n"
+        f"-- Security Review:\n{agent_reviews['security']}\n\n"
+        f"-- UX Review:\n{agent_reviews['ux']}\n\n"
+        f"-- Performance Review:\n{agent_reviews['performance']}"
     )
+
+
 
 
     return ReviewResponse(
         security=security_res,
         ux=ux_res,
         performance=perf_res,
+        test=test_res,
+        ethics=ethics_res,
+        architecture=arch_res,
+        documentation=doc_res,
         summary=action_plan
-    )
+)
+
 
 @app.post("/api/debate", response_model=dict)
 async def debate_code(req: DebateRequest):
     code = req.code
     code_summary = extract_code_structure_summary(code)
 
-    security_res, ux_res, perf_res = await asyncio.gather(
-        persona_review("security auditor", "review this code for vulnerabilities", code, code_summary),
-        persona_review("UX designer", "critique readability and maintainability of this code", code, code_summary),
-        persona_review("performance engineer", "suggest optimizations for this code", code, code_summary),
-    )
+    selected_agents = ["security", "ux", "performance", "test", "architecture", "documentation"]
+    tasks = [
+        persona_review(role, instruction, code, code_summary)
+        for key, (role, instruction) in AGENTS.items() if key in selected_agents
+    ]
+    results = await asyncio.gather(*tasks)
 
-    action_plan = await call_claude(
-        f"Here are three expert reviews...\n\n"
-        f"-- Security Review:\n{security_res}\n\n"
-        f"-- UX Review:\n{ux_res}\n\n"
-        f"-- Performance Review:\n{perf_res}"
-    )
+    # map back to keys
+    agent_reviews = dict(zip(selected_agents, results))
+
+
+    # action_plan = await call_claude(
+    #     f"Here are three expert reviews...\n\n"
+    #     f"-- Security Review:\n{security_res}\n\n"
+    #     f"-- UX Review:\n{ux_res}\n\n"
+    #     f"-- Performance Review:\n{perf_res}"
+    # )
+
+    action_prompt = "\n\n".join(f"-- {key.capitalize()} Review:\n{text}" for key, text in agent_reviews.items())
+
+    action_plan = await call_claude(f"Here are expert reviews:\n\n{action_prompt}")
 
     return {
         "structure_summary": code_summary,
-        "security_review": security_res,
-        "ux_review": ux_res,
-        "performance_review": perf_res,
+        **{f"{key}_review": text for key, text in agent_reviews.items()},
         "action_plan": action_plan,
     }
+
 
 @app.post("/api/summary",  response_model=SummaryResponse)
 async def summarize_reviews(req: ReviewRequest) -> SummaryResponse:
@@ -206,11 +236,12 @@ async def summarize_reviews(req: ReviewRequest) -> SummaryResponse:
     code = await fetch_file_content(owner, repo, branch, req.file_path)
     code_summary = extract_code_structure_summary(code)
 
-    reviews = await asyncio.gather(
-        persona_review("security auditor", "review this code for vulnerabilities", code, code_summary),
-        persona_review("UX designer", "critique readability and maintainability of this code", code, code_summary),
-        persona_review("performance engineer", "suggest optimizations for this code", code, code_summary),
-    )
+    selected_agents = ["security", "ux", "performance", "test", "architecture", "documentation"]
+    reviews = await asyncio.gather(*[
+        persona_review(role, instruction, code, code_summary)
+        for key, (role, instruction) in AGENTS.items() if key in selected_agents
+    ])
+
 
     summary = await call_claude(
         f"Summarize the following reviews into short bullet points:\n\n" +
